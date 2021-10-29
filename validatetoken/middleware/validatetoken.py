@@ -41,23 +41,6 @@ _VALIDATETOKEN_OPTS = [
                ' should *not* be the same endpoint the service user utilizes'
                ' for validating tokens, because normal end users may not be'
                ' able to reach that endpoint.'),
-    cfg.StrOpt('auth_uri',
-               deprecated_for_removal=True,
-               deprecated_reason='The auth_uri option is deprecated in favor'
-               ' of www_authenticate_uri and will be removed in the S '
-               ' release.',
-               deprecated_since='Queens',
-               help='Complete "public" Identity API endpoint. This endpoint'
-               ' should not be an "admin" endpoint, as it should be accessible'
-               ' by all end users. Unauthenticated clients are redirected to'
-               ' this endpoint to authenticate. Although this endpoint should'
-               ' ideally be unversioned, client support in the wild varies.'
-               ' If you\'re using a versioned v2 endpoint here, then this'
-               ' should *not* be the same endpoint the service user utilizes'
-               ' for validating tokens, because normal end users may not be'
-               ' able to reach that endpoint. This option is deprecated in'
-               ' favor of www_authenticate_uri and will be removed in the S'
-               ' release.'),
     cfg.BoolOpt('delay_auth_decision',
                 default=False,
                 help='Do not handle authorization requests within the'
@@ -127,12 +110,6 @@ _VALIDATETOKEN_OPTS = [
                 default=True,
                 help='(Optional) Use the advanced (eventlet safe) memcached '
                      'client pool.'),
-    cfg.BoolOpt('include_service_catalog',
-                default=True,
-                help='(Optional) Indicate whether to set the X-Service-Catalog'
-                ' header. If False, middleware will not ask for service'
-                ' catalog on token validation and will not set the'
-                ' X-Service-Catalog header.'),
 ]
 CONF = cfg.CONF
 CONF.register_opts(_VALIDATETOKEN_OPTS, group=VALIDATETOKEN_MIDDLEWARE_GROUP)
@@ -347,16 +324,14 @@ class ValidateToken:
 
         if security_strategy.lower() != 'none':
             secret_key = self._conf.get('memcache_secret_key')
-            return _cache.SecureTokenCache(self.log,
-                                           security_strategy,
-                                           secret_key,
-                                           **cache_kwargs)
+            return _cache.SecureTokenCache(
+                self.log, security_strategy, secret_key, **cache_kwargs)
         else:
             return _cache.TokenCache(self.log, **cache_kwargs)
 
 
 def _list_opts():
-    """Return a list of oslo_config options available in audit middleware.
+    """Return a list of oslo_config options available in validatetoken middleware.
 
     The returned list includes all oslo_config options which may be registered
     at runtime by the project.
