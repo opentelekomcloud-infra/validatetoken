@@ -18,18 +18,21 @@ import webob.dec
 
 import iso8601
 
-from keystonemiddleware._common import config
 from keystonemiddleware.auth_token import _cache
 from keystonemiddleware.auth_token import _exceptions as ksm_exceptions
 import oslo_cache
 from oslo_config import cfg
 from oslo_log import log as logging
+from oslo_middleware.base import ConfigurableMiddleware
 from oslo_serialization import jsonutils
 
 _CACHE_INVALID_INDICATOR = 'invalid'
 VALIDATETOKEN_MIDDLEWARE_GROUP = 'validatetoken'
 
 _VALIDATETOKEN_OPTS = [
+    cfg.StrOpt('log_name',
+               help='Log Name',
+               default='validatetoken'),
     cfg.StrOpt('www_authenticate_uri',
                deprecated_name='auth_uri',
                help='Complete "public" Identity API endpoint. This endpoint'
@@ -41,6 +44,8 @@ _VALIDATETOKEN_OPTS = [
                ' should *not* be the same endpoint the service user utilizes'
                ' for validating tokens, because normal end users may not be'
                ' able to reach that endpoint.'),
+    cfg.StrOpt('auth_uri',
+               help='Deprecated parameter for Keystone URL'),
     cfg.BoolOpt('delay_auth_decision',
                 default=False,
                 help='Do not handle authorization requests within the'
@@ -112,28 +117,29 @@ _VALIDATETOKEN_OPTS = [
                      'client pool.'),
 ]
 CONF = cfg.CONF
-CONF.register_opts(_VALIDATETOKEN_OPTS, group=VALIDATETOKEN_MIDDLEWARE_GROUP)
 
 oslo_cache.configure(cfg.CONF)
 
 
-class ValidateToken:
+class ValidateToken(ConfigurableMiddleware):
     """Validate token middleware
 
     Fetches the token with the token itself to get it information
     """
 
-    def __init__(self, app, conf):
+    def __init__(self, app, *args, **kwargs):
+        super().__init__(app, *args, **kwargs)
         self.app = app
-        self.conf = conf
-        self._conf = config.Config(
-            'validatetoken', VALIDATETOKEN_MIDDLEWARE_GROUP, _list_opts(), conf
-        )
-        self.log = logging.getLogger(conf.get('log_name', __name__))
+        self.oslo_conf.register_opts(
+            _VALIDATETOKEN_OPTS, VALIDATETOKEN_MIDDLEWARE_GROUP)
+
+        self.log = logging.getLogger(
+            self._conf_get('log_name'))
         self.log.info('Starting validatetoken middleware')
 
-        self._www_authenticate_uri = conf.get('www_authenticate_uri')
-        auth_uri = conf.get('auth_uri')
+        self._www_authenticate_uri = self._conf_get(
+            'www_authenticate_uri')
+        auth_uri = self._conf_get('auth_uri')
         if not self._www_authenticate_uri and auth_uri:
             self._www_authenticate_uri = auth_uri
         if not self._www_authenticate_uri:
@@ -143,7 +149,7 @@ class ValidateToken:
                 'authenticate against an admin endpoint')
             raise RuntimeError
 
-        self._delay_auth_decision = self._conf.get('delay_auth_decision')
+        self._delay_auth_decision = self._conf_get('delay_auth_decision')
 
         self._token_cache = self._token_cache_factory()
 
@@ -270,7 +276,8 @@ class ValidateToken:
 
     def _check_token(self, token):
         self.log.debug('Verifying token')
-        retries = self._conf.get('http_request_max_retries')
+        retries = self._conf_get(
+            'http_request_max_retries', 'validatetoken')
         response = None
         while retries >= 0:
             try:
@@ -281,7 +288,8 @@ class ValidateToken:
                         'X-Auth-Token': token,
                         'X-Subject-Token': token
                         },
-                    timeout=self._conf.get('http_connect_timeout')
+                    timeout=self._conf_get(
+                        'http_connect_timeout', 'validatetoken')
                 )
                 if response.status_code < 500:
                     # Something "reasonable". Do not retry
@@ -306,24 +314,27 @@ class ValidateToken:
         oslo_cache.configure_cache_region(self._conf.oslo_conf_obj, region)
         return region
 
+    def _conf_get(self, param, group=VALIDATETOKEN_MIDDLEWARE_GROUP):
+        return super()._conf_get(param, group)
+
     def _token_cache_factory(self):
 
-        security_strategy = self._conf.get('memcache_security_strategy')
+        security_strategy = self._conf_get('memcache_security_strategy')
 
         cache_kwargs = dict(
-            cache_time=int(self._conf.get('token_cache_time')),
-            env_cache_name=self._conf.get('cache'),
-            memcached_servers=self._conf.get('memcached_servers'),
-            use_advanced_pool=self._conf.get('memcache_use_advanced_pool'),
-            dead_retry=self._conf.get('memcache_pool_dead_retry'),
-            maxsize=self._conf.get('memcache_pool_maxsize'),
-            unused_timeout=self._conf.get('memcache_pool_unused_timeout'),
-            conn_get_timeout=self._conf.get('memcache_pool_conn_get_timeout'),
-            socket_timeout=self._conf.get('memcache_pool_socket_timeout'),
+            cache_time=int(self._conf_get('token_cache_time')),
+            env_cache_name=self._conf_get('cache'),
+            memcached_servers=self._conf_get('memcached_servers'),
+            use_advanced_pool=self._conf_get('memcache_use_advanced_pool'),
+            dead_retry=self._conf_get('memcache_pool_dead_retry'),
+            maxsize=self._conf_get('memcache_pool_maxsize'),
+            unused_timeout=self._conf_get('memcache_pool_unused_timeout'),
+            conn_get_timeout=self._conf_get('memcache_pool_conn_get_timeout'),
+            socket_timeout=self._conf_get('memcache_pool_socket_timeout'),
         )
 
         if security_strategy.lower() != 'none':
-            secret_key = self._conf.get('memcache_secret_key')
+            secret_key = self._conf_get('memcache_secret_key')
             return _cache.SecureTokenCache(
                 self.log, security_strategy, secret_key, **cache_kwargs)
         else:
@@ -346,13 +357,4 @@ def _list_opts():
     ]
 
 
-def filter_factory(global_conf, **local_conf):
-    """Standard filter factory to use the middleware with paste.deploy"""
-
-    conf = global_conf.copy()
-    conf.update(local_conf)
-
-    def auth_filter(app):
-        return ValidateToken(app, conf)
-
-    return auth_filter
+filter_factory = ValidateToken.factory
