@@ -11,17 +11,34 @@
 # under the License.
 import copy
 import datetime
+import logging
 
 from unittest import mock
 
+import fixtures
 import requests
 from requests_mock.contrib import fixture as rm_fixture
 import webob
 
-from keystonemiddleware.tests.unit import utils
+from keystonemiddleware.auth_token import _cache
+from keystonemiddleware.tests.unit.auth_token import base
+from keystonemiddleware.tests.unit.auth_token.test_auth_token_middleware \
+        import (TimeFixture)
+import oslo_cache
+from oslo_utils import timeutils
 
 from validatetoken.middleware import validatetoken
 
+BASE_HOST = 'https://keystone.example.com'
+BASE_URI = '%s/testadmin' % BASE_HOST
+
+EXPECTED_V3_DEFAULT_ENV_ADDITIONS = {
+    'HTTP_X_PROJECT_DOMAIN_ID': 'domain_id1',
+    'HTTP_X_PROJECT_DOMAIN_NAME': 'domain_name1',
+    'HTTP_X_USER_DOMAIN_ID': 'domain_id1',
+    'HTTP_X_USER_DOMAIN_NAME': 'domain_name1',
+    'HTTP_X_IS_ADMIN_PROJECT': 'True'
+}
 
 GOOD_RESPONSE = {
     "token": {
@@ -70,28 +87,90 @@ class FakeResponse(object):
 class FakeApp(object):
     """This represents a WSGI app protected by the auth_token middleware."""
 
-    def __call__(self, env, start_response):
+    SUCCESS = b'SUCCESS'
+    FORBIDDEN = b'FORBIDDEN'
+    expected_env = {}
+
+    def __init__(self, expected_env=None, need_service_token=False):
+        self.expected_env = dict()
+
+        if expected_env:
+            self.expected_env.update(expected_env)
+
+        self.need_service_token = need_service_token
+
+    @webob.dec.wsgify
+    def __call__(self, req):
+        for k, v in self.expected_env.items():
+            assert req.environ[k] == v, '%s != %s' % (req.environ[k], v)
+
         resp = webob.Response()
-        resp.environ = env
-        return resp(env, start_response)
+        resp.body = FakeApp.SUCCESS
+
+        return resp
 
 
-class ValidateTokenMiddlewareTestBase(utils.TestCase):
+class FakeOsloCache(_cache._FakeClient):
+    """A fake oslo_cache object.
+
+    The memcache and oslo_cache interfaces are almost the same except we need
+    to return NO_VALUE when not found.
+    """
+
+    def get(self, key):
+        return super(FakeOsloCache, self).get(key) or oslo_cache.NO_VALUE
+
+
+class ValidateTokenMiddlewareTestBase(base.BaseAuthTokenTestCase):
     TEST_AUTH_URL = 'https://keystone.example.com'
     TEST_URL = '%s/v3/auth/tokens' % (TEST_AUTH_URL,)
 
-    def setUp(self):
+    def setUp(self, expected_env=None, auth_version=None, fake_app=None):
         super(ValidateTokenMiddlewareTestBase, self).setUp()
 
+        self.logger = self.useFixture(fixtures.FakeLogger(level=logging.DEBUG))
+
+        # the default oslo_cache is null cache, always use an in-mem cache
+        self.useFixture(fixtures.MockPatchObject(validatetoken.ValidateToken,
+                                                 '_create_oslo_cache',
+                                                 return_value=FakeOsloCache()))
+
+        self.expected_env = expected_env or dict()
+        self.fake_app = fake_app or FakeApp
+        self.middleware = None
+
         self.conf = {
-            'auth_url': self.TEST_AUTH_URL,
+            'www_authenticate_uri': self.TEST_AUTH_URL,
         }
 
         self.requests_mock = self.useFixture(rm_fixture.Fixture())
 
+        self.token_dict = {
+            'uuid_token_default': '5603457654b346fdbb93437bfe76f2f1'
+        }
+
     def start_fake_response(self, status, headers):
         self.response_status = int(status.split(' ', 1)[0])
         self.response_headers = dict(headers)
+
+    def call_middleware(self, **kwargs):
+        return self.call(self.middleware, **kwargs)
+
+    def set_middleware(self, expected_env=None, conf=None):
+        """Configure the class ready to call the auth_token middleware.
+
+        Set up the various fake items needed to run the middleware.
+        Individual tests that need to further refine these can call this
+        function to override the class defaults.
+        """
+        if conf:
+            self.conf.update(conf)
+
+        if expected_env:
+            self.expected_env.update(expected_env)
+
+        self.middleware = validatetoken.ValidateToken(
+            self.fake_app(self.expected_env), self.conf)
 
 
 class ValidateTokenMiddlewareTestGood(ValidateTokenMiddlewareTestBase):
@@ -138,7 +217,8 @@ class ValidateTokenMiddlewareTestGood(ValidateTokenMiddlewareTestBase):
             'https://keystone.example.com/v3/auth/tokens',
             headers={
                 'X-Auth-Token': 'token',
-                'X-Subject-Token': 'token'}
+                'X-Subject-Token': 'token'},
+            timeout=None
         )
 
     def test_authenticated(self):
@@ -222,3 +302,137 @@ class ValidateTokenMiddlewareTestBad(ValidateTokenMiddlewareTestBase):
 
         resp = req.get_response(self.middleware)
         self.assertEqual(resp.status_int, 401)
+
+
+class Caching(ValidateTokenMiddlewareTestBase):
+    def setUp(self):
+        super().setUp()
+        self.middleware = validatetoken.ValidateToken(FakeApp(), self.conf)
+
+    def _get_cached_token(self, token):
+        return self.middleware._token_cache.get(token)
+
+    def test_memcache_set_invalid_uuid(self):
+        self.requests_mock.get(self.TEST_URL, status_code=404)
+
+        token = 'invalid-token'
+        self.call_middleware(headers={'X-Auth-Token': token},
+                             expected_status=401)
+        self.assertEqual(validatetoken._CACHE_INVALID_INDICATOR,
+                         self._get_cached_token(token))
+
+    def test_memcache_hit_invalid_token(self):
+        token = 'invalid-token'
+        self.requests_mock.get(self.TEST_URL, status_code=404)
+
+        # Call once to cache token's invalid state; verify it cached as such
+        self.call_middleware(headers={'X-Auth-Token': token},
+                             expected_status=401)
+        self.assertEqual(validatetoken._CACHE_INVALID_INDICATOR,
+                         self._get_cached_token(token))
+
+        # Call again for a cache hit; verify it detected as cached and invalid
+        self.call_middleware(headers={'X-Auth-Token': token},
+                             expected_status=401)
+        self.assertIn('Cached token is marked unauthorized',
+                      self.logger.output)
+
+    def test_memcache_set_expired(self, extra_conf={}, extra_environ={}):
+        response = copy.deepcopy(GOOD_RESPONSE)
+        expires_at = datetime.datetime.now() + datetime.timedelta(hours=1)
+        response['token']['expires_at'] = expires_at.isoformat()
+
+        self.requests_mock.get(self.TEST_URL,
+                               status_code=200,
+                               headers={
+                                   'Content-Type': 'application/json'
+                               },
+                               json=response)
+
+        token_cache_time = 10
+        conf = {
+            'token_cache_time': '%s' % token_cache_time,
+        }
+        conf.update(extra_conf)
+        self.set_middleware(conf=conf)
+
+        token = self.token_dict['uuid_token_default']
+        self.call_middleware(headers={'X-Auth-Token': token})
+
+        req = webob.Request.blank('/')
+        req.headers['X-Auth-Token'] = token
+        req.environ.update(extra_environ)
+
+        now = datetime.datetime.utcnow()
+        self.useFixture(TimeFixture(now))
+        req.get_response(self.middleware)
+        self.assertIsNotNone(self._get_cached_token(token))
+
+        timeutils.advance_time_seconds(token_cache_time)
+        self.assertIsNone(self._get_cached_token(token))
+
+    def test_http_error_not_cached_token(self):
+        """Test to don't cache token as invalid on network errors.
+
+        We use UUID tokens since they are the easiest one to reach
+        get_http_connection.
+        """
+        self.requests_mock.get(self.TEST_URL, status_code=503)
+        self.set_middleware(conf={'http_request_max_retries': '0'})
+        self.call_middleware(headers={'X-Auth-Token': 'invalid-token'},
+                             expected_status=503)
+        self.assertIsNone(self._get_cached_token('invalid-token'))
+
+
+class CachePoolTest(ValidateTokenMiddlewareTestBase):
+    def test_use_cache_from_env(self):
+        # If `swift.cache` is set in the environment and `cache` is set in the
+        # config then the env cache is used.
+        env = {'swift.cache': 'CACHE_TEST'}
+        conf = {
+            'cache': 'swift.cache'
+        }
+        self.set_middleware(conf=conf)
+        self.middleware._token_cache.initialize(env)
+        with self.middleware._token_cache._cache_pool.reserve() as cache:
+            self.assertEqual(cache, 'CACHE_TEST')
+
+    def test_not_use_cache_from_env(self):
+        # If `swift.cache` is set in the environment but `cache` isn't set
+        # initialize the config then the env cache isn't used.
+        self.set_middleware()
+        env = {'swift.cache': 'CACHE_TEST'}
+        self.middleware._token_cache.initialize(env)
+        with self.middleware._token_cache._cache_pool.reserve() as cache:
+            self.assertNotEqual(cache, 'CACHE_TEST')
+
+    def test_multiple_context_managers_share_single_client(self):
+        self.set_middleware()
+        token_cache = self.middleware._token_cache
+        env = {}
+        token_cache.initialize(env)
+
+        caches = []
+
+        with token_cache._cache_pool.reserve() as cache:
+            caches.append(cache)
+
+        with token_cache._cache_pool.reserve() as cache:
+            caches.append(cache)
+
+        self.assertIs(caches[0], caches[1])
+        self.assertEqual(set(caches), set(token_cache._cache_pool))
+
+    def test_nested_context_managers_create_multiple_clients(self):
+        self.set_middleware()
+        env = {}
+        self.middleware._token_cache.initialize(env)
+        token_cache = self.middleware._token_cache
+
+        with token_cache._cache_pool.reserve() as outer_cache:
+            with token_cache._cache_pool.reserve() as inner_cache:
+                self.assertNotEqual(outer_cache, inner_cache)
+
+        self.assertEqual(
+            set([inner_cache, outer_cache]),
+            set(token_cache._cache_pool))
