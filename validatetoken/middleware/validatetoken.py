@@ -137,7 +137,7 @@ class ValidateToken:
         if not self._www_authenticate_uri and auth_uri:
             self._www_authenticate_uri = auth_uri
         if not self._www_authenticate_uri:
-            self.log.fatal(
+            self.log.error(
                 'Configuring www_authenticate_uri to point to the public '
                 'identity endpoint is required; clients may not be able to '
                 'authenticate against an admin endpoint')
