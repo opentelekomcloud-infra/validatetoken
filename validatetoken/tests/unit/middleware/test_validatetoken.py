@@ -273,6 +273,45 @@ class ValidateTokenMiddlewareTestGood(ValidateTokenMiddlewareTestBase):
             env['HTTP_X_ROLES']
         )
 
+    def test_spoofed_identity_headers_are_stripped(self):
+        # ES-795: an unauthenticated client must not be able to assert an
+        # identity by supplying the identity headers directly. Without this
+        # sanitisation a request carrying "X-Identity-Status: Confirmed" and
+        # "X-Roles: ResellerAdmin" would be trusted by downstream keystoneauth.
+        req = webob.Request.blank('/dummy')
+        req.headers['X-Identity-Status'] = 'Confirmed'
+        req.headers['X-Roles'] = 'ResellerAdmin'
+        req.headers['X-Project-Id'] = 'spoofed-project'
+        req.headers['X-User-Id'] = 'spoofed-user'
+        req.headers['X-Tenant-Name'] = 'spoofed-tenant'
+
+        resp = req.get_response(self.middleware)
+
+        # No valid token -> the request is forwarded unauthenticated ...
+        self.assertEqual(resp.status_int, 200)
+        # ... but every spoofed identity header must have been removed.
+        for key in ('HTTP_X_IDENTITY_STATUS', 'HTTP_X_ROLES',
+                    'HTTP_X_PROJECT_ID', 'HTTP_X_USER_ID',
+                    'HTTP_X_TENANT_NAME'):
+            self.assertNotIn(key, req.environ)
+
+    def test_spoofed_headers_overridden_by_validated_token(self):
+        # Even with a valid token, client-supplied identity headers must be
+        # discarded and replaced with the values derived from the token.
+        req = webob.Request.blank('/dummy')
+        req.headers['X-Auth-Token'] = 'token'
+        req.headers['X-Identity-Status'] = 'Confirmed'
+        req.headers['X-Roles'] = 'ResellerAdmin'
+
+        resp = req.get_response(self.middleware)
+        self.assertEqual(resp.status_int, 200)
+
+        token = GOOD_RESPONSE['token']
+        self.assertEqual(
+            ','.join([f['name'] for f in token['roles']]),
+            req.environ['HTTP_X_ROLES']
+        )
+
 
 class ValidateTokenMiddlewareTestBad(ValidateTokenMiddlewareTestBase):
 
