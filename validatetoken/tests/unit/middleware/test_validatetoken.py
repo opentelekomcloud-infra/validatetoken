@@ -22,8 +22,6 @@ import webob
 
 from keystonemiddleware.auth_token import _cache
 from keystonemiddleware.tests.unit.auth_token import base
-from keystonemiddleware.tests.unit.auth_token.test_auth_token_middleware \
-        import (TimeFixture)
 import oslo_cache
 from oslo_utils import timeutils
 
@@ -402,13 +400,18 @@ class Caching(ValidateTokenMiddlewareTestBase):
         req.headers['X-Auth-Token'] = token
         req.environ.update(extra_environ)
 
+        # Control time via mock.patch instead of the deprecated
+        # timeutils.set_time_override()-based TimeFixture: oslotest escalates
+        # its DeprecationWarning to an error, which fails the test on py311.
         now = datetime.datetime.utcnow()
-        self.useFixture(TimeFixture(now))
-        req.get_response(self.middleware)
-        self.assertIsNotNone(self._get_cached_token(token))
+        with mock.patch.object(timeutils, 'utcnow') as mock_utcnow:
+            mock_utcnow.return_value = now
+            req.get_response(self.middleware)
+            self.assertIsNotNone(self._get_cached_token(token))
 
-        timeutils.advance_time_seconds(token_cache_time)
-        self.assertIsNone(self._get_cached_token(token))
+            mock_utcnow.return_value = now + datetime.timedelta(
+                seconds=token_cache_time + 1)
+            self.assertIsNone(self._get_cached_token(token))
 
     def test_http_error_not_cached_token(self):
         """Test to don't cache token as invalid on network errors.
