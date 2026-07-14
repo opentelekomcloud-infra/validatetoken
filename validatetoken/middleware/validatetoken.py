@@ -29,6 +29,53 @@ from oslo_serialization import jsonutils
 _CACHE_INVALID_INDICATOR = 'invalid'
 VALIDATETOKEN_MIDDLEWARE_GROUP = 'validatetoken'
 
+# Identity headers that this middleware asserts to downstream WSGI components
+# (e.g. swift's keystoneauth) after it has successfully validated a token.
+# They MUST never be honoured when supplied by the client: because WSGI maps
+# request headers straight into ``environ`` (``X-Roles`` -> ``HTTP_X_ROLES``),
+# an unauthenticated caller could otherwise spoof an identity -- e.g. send
+# ``X-Identity-Status: Confirmed`` together with ``X-Roles: ResellerAdmin`` --
+# and bypass authentication entirely. keystonemiddleware.auth_token strips the
+# same set via ``_remove_auth_headers()``; this middleware must do likewise.
+_AUTH_HEADERS = (
+    'X-Identity-Status',
+    'X-Service-Identity-Status',
+    'X-Domain-Id',
+    'X-Domain-Name',
+    'X-Project-Id',
+    'X-Project-Name',
+    'X-Project-Domain-Id',
+    'X-Project-Domain-Name',
+    'X-User-Id',
+    'X-User-Name',
+    'X-User-Domain-Id',
+    'X-User-Domain-Name',
+    'X-Roles',
+    'X-Service-Domain-Id',
+    'X-Service-Domain-Name',
+    'X-Service-Project-Id',
+    'X-Service-Project-Name',
+    'X-Service-Project-Domain-Id',
+    'X-Service-Project-Domain-Name',
+    'X-Service-User-Id',
+    'X-Service-User-Name',
+    'X-Service-User-Domain-Id',
+    'X-Service-User-Domain-Name',
+    'X-Service-Roles',
+    'X-Service-Catalog',
+    # Deprecated pre-v3 identity headers still honoured by some middleware.
+    'X-Role',
+    'X-User',
+    'X-Tenant-Id',
+    'X-Tenant-Name',
+    'X-Tenant',
+)
+
+# Pre-compute the corresponding WSGI ``environ`` keys once at import time.
+_AUTH_HEADER_ENVIRON_KEYS = tuple(
+    'HTTP_' + header.upper().replace('-', '_') for header in _AUTH_HEADERS
+)
+
 _VALIDATETOKEN_OPTS = [
     cfg.StrOpt('log_name',
                help='Log Name',
@@ -172,8 +219,24 @@ class ValidateToken(ConfigurableMiddleware):
         resp.body = body.encode()
         return resp
 
+    @staticmethod
+    def _remove_auth_headers(environ):
+        """Strip any client-supplied identity headers from the request.
+
+        Downstream authorization middleware (swift keystoneauth) trusts the
+        ``X-Identity-Status``/``X-Roles``/``X-*-Id`` headers. If a client is
+        allowed to set them, an unauthenticated request can impersonate a
+        privileged user and bypass authentication. We therefore remove them
+        unconditionally on every request and only re-populate them below from
+        a token that this middleware has actually validated.
+        """
+        for key in _AUTH_HEADER_ENVIRON_KEYS:
+            environ.pop(key, None)
+
     def __call__(self, environ, start_response):
         self.log.debug('Entering Validating token auth %s' % environ)
+        # Sanitise spoofable identity headers before doing anything else.
+        self._remove_auth_headers(environ)
         self._token_cache.initialize(environ)
         token = environ.get('HTTP_X_AUTH_TOKEN')
         if token:
