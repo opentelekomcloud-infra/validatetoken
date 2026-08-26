@@ -1,0 +1,24 @@
+CHANGES
+=======
+
+0.3.0
+-----
+
+* Strip spoofable identity headers before token validation (ES-795) (#5)
+
+0.2.0
+-----
+
+* rebase to oslo\_middleware (#4)
+* drop wrong used log.fatal (#3)
+
+0.1.0
+-----
+
+* Add token cache support (#2)
+
+0.0.1
+-----
+
+* First implementation
+* Initial commit
